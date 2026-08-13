@@ -1,0 +1,180 @@
+{
+  "info": {
+    "_postman_id": "b4e2f1a0-6c3d-4f1a-9e2a-0a1c2d3e4f5a",
+    "name": "Mini Load Balancer",
+    "description": "Covers the load balancer's proxy route, each backend's own /health endpoint, and the all-backends-down 503 case. Run the 'Proxy & Health' folder with the normal stack running (npm run start:all + node server.js). The 'Failure Scenario' folder requires all three backends to be stopped first - see its request description.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "lbBaseUrl", "value": "http://localhost:8080", "type": "string" },
+    { "key": "backend1BaseUrl", "value": "http://localhost:3001", "type": "string" },
+    { "key": "backend2BaseUrl", "value": "http://localhost:3002", "type": "string" },
+    { "key": "backend3BaseUrl", "value": "http://localhost:3003", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Proxy & Health (normal state)",
+      "item": [
+        {
+          "name": "Load Balancer - Proxy Route",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{lbBaseUrl}}/", "host": ["{{lbBaseUrl}}"], "path": [""] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('response identifies a backend server', function () {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body).to.have.property('server');",
+                  "  pm.expect(body.server.trim()).to.match(/^backend-\\d+$/);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Load Balancer - Aggregate Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{lbBaseUrl}}/health", "host": ["{{lbBaseUrl}}"], "path": ["health"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "pm.test('reports 3 backends, all alive', function () {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('ok');",
+                  "  pm.expect(body.backends).to.have.lengthOf(3);",
+                  "  body.backends.forEach((b) => pm.expect(b.isAlive).to.be.true);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Backend-1 - Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{backend1BaseUrl}}/health", "host": ["{{backend1BaseUrl}}"], "path": ["health"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200 and healthy', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('ok');",
+                  "  pm.expect(body.server.trim()).to.eql('backend-1');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Backend-2 - Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{backend2BaseUrl}}/health", "host": ["{{backend2BaseUrl}}"], "path": ["health"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200 and healthy', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('ok');",
+                  "  pm.expect(body.server.trim()).to.eql('backend-2');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Backend-3 - Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{backend3BaseUrl}}/health", "host": ["{{backend3BaseUrl}}"], "path": ["health"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 200 and healthy', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.status).to.eql('ok');",
+                  "  pm.expect(body.server.trim()).to.eql('backend-3');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Failure Scenario (requires all backends stopped)",
+      "item": [
+        {
+          "name": "Load Balancer - All Backends Down -> 503",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{lbBaseUrl}}/", "host": ["{{lbBaseUrl}}"], "path": [""] },
+            "description": "Run this only after stopping all three backend processes (the load balancer itself must stay running). It proves the load balancer fails clean instead of hanging or crashing when every backend is unreachable."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status is 503', function () {",
+                  "  pm.response.to.have.status(503);",
+                  "});",
+                  "",
+                  "pm.test('body is a clean JSON error', function () {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body).to.have.property('error');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

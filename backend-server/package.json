@@ -1,0 +1,16 @@
+{
+  "name": "backend-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:1": "cmd /c \"set SERVER_ID=backend-1 && set PORT=3001 && node server.js\"",
+    "start:2": "cmd /c \"set SERVER_ID=backend-2 && set PORT=3002 && node server.js\"",
+    "start:3": "cmd /c \"set SERVER_ID=backend-3 && set PORT=3003 && node server.js\"",
+    "start:all": "start /B cmd /c \"set SERVER_ID=backend-1 && set PORT=3001 && node server.js\" && start /B cmd /c \"set SERVER_ID=backend-2 && set PORT=3002 && node server.js\" && start /B cmd /c \"set SERVER_ID=backend-3 && set PORT=3003 && node server.js\""
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

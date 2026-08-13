@@ -1,0 +1,11 @@
+node_modules/
+npm-debug.log*
+
+# Runtime log output - the directory is tracked, the log files are not
+logs/*.log
+
+# Superseded by backend-server/ (single server.js driven by SERVER_ID/PORT
+# env vars, see README) - kept on disk for now but not part of the MVP
+backend-server-1/
+backend-server-2/
+backend-server-3/
