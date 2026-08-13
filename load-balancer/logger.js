@@ -90,6 +90,10 @@ function logFailover({ method, path: reqPath, triedServers }) {
   error(`FAILOVER_EXHAUSTED method=${method} path=${reqPath} triedServers=${triedServers}`);
 }
 
+function logAlgorithmSwitch({ from, to, source }) {
+  info(`ALGORITHM_SWITCH from=${from} to=${to} source=${source}`);
+}
+
 module.exports = {
   LEVELS,
   info,
@@ -102,5 +106,6 @@ module.exports = {
   logHealthCheck,
   logTransition,
   logRetry,
-  logFailover
+  logFailover,
+  logAlgorithmSwitch
 };

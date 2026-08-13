@@ -3,7 +3,7 @@ const path = require('path');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
-const SUPPORTED_ALGORITHMS = ['round-robin'];
+const SUPPORTED_ALGORITHMS = ['round-robin', 'least-connections'];
 const LOG_LEVELS = ['INFO', 'WARN', 'ERROR'];
 
 const DEFAULTS = {
@@ -131,7 +131,12 @@ function loadConfig() {
 }
 
 // Loaded and validated once; every require() of this module gets the same
-// cached object (Node caches modules), so config is parsed exactly once.
+// cached object (Node caches modules), so config is parsed exactly once at
+// startup. reload() re-reads and re-validates config.json on demand, for
+// callers (see server.js's config.json watcher) that want to react to
+// runtime edits without a process restart.
 module.exports = loadConfig();
 module.exports.SUPPORTED_ALGORITHMS = SUPPORTED_ALGORITHMS;
 module.exports.LOG_LEVELS = LOG_LEVELS;
+module.exports.CONFIG_PATH = CONFIG_PATH;
+module.exports.reload = loadConfig;

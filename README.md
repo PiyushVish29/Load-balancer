@@ -15,7 +15,8 @@ client -> load balancer (:8080) -> backend-1 (:3001)
 ```
 
 - The load balancer buffers each incoming request body, then forwards it to the next
-  healthy backend (round-robin).
+  healthy backend, chosen by the active algorithm (Round Robin or Least Connections -
+  see below, switchable live).
 - A background health checker polls every backend's `/health` endpoint on an interval
   and flips its alive/dead state on status change.
 - If a forward fails at request time (connection refused, reset, or timeout), that
@@ -46,7 +47,8 @@ load balancer/
 │  ├─ logger.js                     console + file logging, in-memory ring buffer
 │  └─ algorithms/
 │     ├─ index.js                   algorithm-name -> implementation lookup
-│     └─ roundRobin.js
+│     ├─ roundRobin.js
+│     └─ leastConnections.js
 ├─ logs/
 │  └─ load-balancer.log             created at runtime (gitignored)
 └─ verify-health-check.ps1          scripted failover proof (kill/restart backend-2)
@@ -98,7 +100,7 @@ The load balancer listens on `http://localhost:8080`. `GET /` proxies to a backe
 |---------------------------|--------------------------------------------------------------------------|---------|
 | `port`                    | Port the load balancer listens on                                       | `8080` |
 | `backends`                | Array of `{ id, host, port }` - the full backend pool                   | 3 local backends on 3001-3003 |
-| `algorithm`               | Load-balancing algorithm by name (currently only `"round-robin"`)       | `"round-robin"` |
+| `algorithm`               | Load-balancing algorithm by name: `"round-robin"` or `"least-connections"` | `"round-robin"` |
 | `healthCheck.intervalMs`  | How often the background health checker polls every backend's `/health` | `5000` |
 | `healthCheck.timeoutMs`   | How long a single health check waits before treating it as a failure    | `1500` |
 | `retryCount`               | Max backends tried per client request (including the first try), further capped at the number of configured backends | `3` |
@@ -110,6 +112,56 @@ missing file, malformed JSON, missing field, or invalid value (wrong type, out-o
 port, unknown algorithm name, duplicate backend id, etc.) is replaced with its default
 and logged as a `[config] ... - using default` warning to the console - the load
 balancer never fails to start because of a bad config file.
+
+## Load-balancing algorithms
+
+**Round Robin** cycles through healthy backends in fixed order (1, 2, 3, 1, 2, 3, ...)
+and never looks at how busy any of them currently are. **Least Connections** always
+routes to whichever healthy backend has the fewest `activeConnections` right now, and
+only falls back to round-robin ordering to break an exact tie.
+
+That difference only shows up under **uneven request durations**. If every request
+takes about the same time, both algorithms converge on the same even split, because
+by the time the next request arrives the previous one is usually already done. But mix
+in slow requests: Round Robin will still hand a busy backend its next request purely
+because rotation says it's that backend's turn - it has no idea the backend is still
+working on something else. Least Connections sees that backend's count is elevated and
+routes around it until it frees up, so short requests keep landing on whichever backend
+is actually free instead of queuing up behind a slow one.
+
+Proof, captured live against this code: one slow request (`/work`, ~300ms) was sent to
+backend-1, then six fast requests (`/`) were sent while it was still in flight.
+
+```
+=== ROUND ROBIN ===
+backend-1 (busy with SLOW the whole time) got 2/6 of the fast burst
+
+=== LEAST CONNECTIONS ===
+backend-1 (busy with SLOW the whole time) got 0/6 of the fast burst
+```
+
+`activeConnections` is incremented the instant a request is forwarded to a backend and
+decremented exactly once when that connection's outcome is known - on a normal response,
+a backend error, a request timeout, or the client disconnecting early - so the count
+never leaks even under failures or aborted requests.
+
+### Switching algorithms at runtime (no restart)
+
+The active algorithm can be changed live two ways, both logged as `ALGORITHM_SWITCH`:
+
+- **API**: `GET /algorithm` returns the current algorithm and the supported list;
+  `POST /algorithm` with `{"algorithm": "least-connections"}` switches it immediately.
+  ```bash
+  curl http://localhost:8080/algorithm
+  curl -X POST -H "Content-Type: application/json" \
+       -d '{"algorithm":"least-connections"}' http://localhost:8080/algorithm
+  ```
+- **Config file**: edit `algorithm` in `load-balancer/config.json` and save. The load
+  balancer watches the file and picks up a valid new value within ~150ms - no restart,
+  no API call needed.
+
+An unsupported algorithm name (from either path) is rejected/ignored with a warning;
+the load balancer keeps running the previously active algorithm.
 
 ### Adding a fourth backend
 
@@ -146,6 +198,8 @@ What gets logged, with the event tag each line starts with:
 - `TRANSITION` - every UP<->DOWN state change (WARN going down, INFO recovering)
 - `RETRY` - a request-time failure and the immediate retry it triggers
 - `FAILOVER_EXHAUSTED` - every healthy backend was tried and none worked (precedes the 503)
+- `CLIENT_DISCONNECT` - the client closed the connection before a response was sent
+- `ALGORITHM_SWITCH` - the active algorithm changed, and whether it came from the API or a config.json edit
 
 `logger.getRecentLogs(limit)` also keeps the most recent 1000 entries in memory (subject
 to the same level filter) for a future dashboard to read without re-parsing the log file.

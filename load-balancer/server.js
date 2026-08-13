@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
 const config = require('./config');
 const { servers } = require('./backendServers');
@@ -7,9 +9,31 @@ const logger = require('./logger');
 
 const PORT = config.port;
 const BACKEND_TIMEOUT_MS = 3000;
-const selectedAlgorithm = algorithms[config.algorithm];
 // Never try more backends than exist, regardless of what retryCount says.
 const MAX_ATTEMPTS = Math.min(config.retryCount, servers.length);
+
+// The active algorithm is mutable at runtime (via the /algorithm endpoint or
+// a config.json edit) - always look it up through this function rather than
+// caching the module reference, so a switch takes effect on the very next
+// request without a restart.
+let currentAlgorithm = config.algorithm;
+
+function getCurrentAlgorithm() {
+  return currentAlgorithm;
+}
+
+function setAlgorithm(name, source) {
+  if (!algorithms[name]) {
+    return { ok: false, error: `Unsupported algorithm "${name}". Supported: ${Object.keys(algorithms).join(', ')}` };
+  }
+  if (name === currentAlgorithm) {
+    return { ok: true, changed: false, algorithm: currentAlgorithm };
+  }
+  const previous = currentAlgorithm;
+  currentAlgorithm = name;
+  logger.logAlgorithmSwitch({ from: previous, to: currentAlgorithm, source });
+  return { ok: true, changed: true, algorithm: currentAlgorithm };
+}
 
 function sendErrorResponse(res, statusCode, message) {
   if (res.headersSent) {
@@ -18,6 +42,11 @@ function sendErrorResponse(res, statusCode, message) {
   }
   res.writeHead(statusCode, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: message }));
+}
+
+function sendJson(res, statusCode, body) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
 }
 
 function collectRequestBody(req) {
@@ -34,10 +63,25 @@ function collectRequestBody(req) {
 // The client request body is buffered once so it can be replayed against a
 // second backend if the first one fails before sending a response.
 // `ctx` carries the per-request fields (method/path/ip/start time/which
-// backend last handled it) that the res 'finish' listener logs at the end.
+// backend last handled it, and how to release its connection count) that
+// the top-level handler logs and cleans up when the response ends.
 function forwardToServer(targetServer, req, body, res, triedServerIds, ctx) {
   targetServer.activeConnections += 1;
   ctx.lastBackend = targetServer.id;
+
+  // activeConnections must be decremented exactly once no matter which of
+  // several possible exit paths fires (normal completion, backend error,
+  // timeout, or the client disconnecting) - release() makes that safe to
+  // call from all of them.
+  let released = false;
+  function release() {
+    if (released) {
+      return;
+    }
+    released = true;
+    targetServer.activeConnections -= 1;
+  }
+  ctx.releaseCurrent = release;
 
   const headers = { ...req.headers };
   delete headers['content-length'];
@@ -59,12 +103,10 @@ function forwardToServer(targetServer, req, body, res, triedServerIds, ctx) {
     res.writeHead(backendRes.statusCode, backendRes.headers);
     backendRes.pipe(res);
 
-    backendRes.on('end', () => {
-      targetServer.activeConnections -= 1;
-    });
+    backendRes.on('end', release);
 
     backendRes.on('error', (error) => {
-      targetServer.activeConnections -= 1;
+      release();
       logger.error(`STREAM_ERROR backend=${targetServer.id} message="${error.message}"`);
       res.destroy();
     });
@@ -75,7 +117,7 @@ function forwardToServer(targetServer, req, body, res, triedServerIds, ctx) {
   });
 
   backendReq.on('error', (error) => {
-    targetServer.activeConnections -= 1;
+    release();
 
     // Once headers are already sent to the client we can't restart the
     // response on another backend, so the failure just ends the connection.
@@ -108,7 +150,7 @@ function attemptForward(req, body, res, triedServerIds, ctx) {
     return sendErrorResponse(res, 503, 'No backend servers available');
   }
 
-  const targetServer = selectedAlgorithm.getNextServer(triedServerIds);
+  const targetServer = algorithms[getCurrentAlgorithm()].getNextServer(triedServerIds);
 
   if (!targetServer) {
     logger.logFailover({ method: req.method, path: req.url, triedServers: triedServerIds.length });
@@ -127,18 +169,51 @@ function proxyRequest(req, res, ctx) {
     });
 }
 
+function handleAlgorithmEndpoint(req, res) {
+  if (req.method === 'GET') {
+    return sendJson(res, 200, { algorithm: getCurrentAlgorithm(), supported: Object.keys(algorithms) });
+  }
+
+  if (req.method === 'POST') {
+    return collectRequestBody(req)
+      .then((body) => {
+        let parsed;
+        try {
+          parsed = JSON.parse(body.toString('utf8') || '{}');
+        } catch (error) {
+          return sendErrorResponse(res, 400, 'Invalid JSON body');
+        }
+
+        const result = setAlgorithm(parsed.algorithm, 'api');
+        if (!result.ok) {
+          return sendErrorResponse(res, 400, result.error);
+        }
+        return sendJson(res, 200, { algorithm: result.algorithm, changed: result.changed });
+      })
+      .catch((error) => {
+        logger.warn(`CLIENT_ERROR method=${req.method} path=${req.url} message="${error.message}"`);
+        sendErrorResponse(res, 400, 'Client request error');
+      });
+  }
+
+  return sendErrorResponse(res, 405, 'Method not allowed');
+}
+
 const loadBalancer = http.createServer((req, res) => {
   const ctx = {
     method: req.method,
     path: req.url,
     ip: req.socket.remoteAddress,
     startTime: process.hrtime.bigint(),
-    lastBackend: null
+    lastBackend: null,
+    releaseCurrent: null
   };
 
   logger.logRequest({ method: ctx.method, path: ctx.path, ip: ctx.ip });
 
+  let responded = false;
   res.on('finish', () => {
+    responded = true;
     const durationMs = Number(process.hrtime.bigint() - ctx.startTime) / 1e6;
     logger.logResponse({
       backend: ctx.lastBackend,
@@ -149,12 +224,25 @@ const loadBalancer = http.createServer((req, res) => {
     });
   });
 
+  // Covers the client disconnecting before the backend response completes
+  // ('close' fires on abnormal close too, not just after 'finish') -
+  // releaseCurrent is idempotent with the normal release paths in
+  // forwardToServer, so this never double-decrements.
+  res.on('close', () => {
+    if (ctx.releaseCurrent) {
+      ctx.releaseCurrent();
+    }
+    if (!responded) {
+      const durationMs = Number(process.hrtime.bigint() - ctx.startTime) / 1e6;
+      logger.warn(`CLIENT_DISCONNECT backend=${ctx.lastBackend || 'none'} method=${ctx.method} path=${ctx.path} durationMs=${Math.round(durationMs * 100) / 100}`);
+    }
+  });
+
   if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    return sendJson(res, 200, {
       status: 'ok',
       loadBalancer: 'node-http-proxy',
-      algorithm: config.algorithm,
+      algorithm: getCurrentAlgorithm(),
       backends: servers.map(server => ({
         id: server.id,
         host: server.host,
@@ -163,11 +251,40 @@ const loadBalancer = http.createServer((req, res) => {
         activeConnections: server.activeConnections,
         totalRequests: server.totalRequests
       }))
-    }));
-    return;
+    });
+  }
+
+  if (req.url === '/algorithm') {
+    return handleAlgorithmEndpoint(req, res);
   }
 
   proxyRequest(req, res, ctx);
+});
+
+// Lets `algorithm` in config.json be changed live: on every save, re-read
+// and re-validate the file and, if the algorithm field changed to a
+// supported value, switch to it - same effect as the API endpoint, just
+// triggered by the file instead of an HTTP call. Watching the containing
+// directory (rather than the file itself) and filtering by filename because
+// fs.watch on a single file misses editors/tools that save via
+// write-to-temp-then-rename instead of an in-place write. Debounced because
+// a save commonly fires more than one change event.
+let configWatchTimer = null;
+fs.watch(path.dirname(config.CONFIG_PATH), { persistent: false }, (eventType, filename) => {
+  if (filename !== path.basename(config.CONFIG_PATH)) {
+    return;
+  }
+  clearTimeout(configWatchTimer);
+  configWatchTimer = setTimeout(() => {
+    let fresh;
+    try {
+      fresh = config.reload();
+    } catch (error) {
+      logger.warn(`CONFIG_RELOAD_FAILED message="${error.message}"`);
+      return;
+    }
+    setAlgorithm(fresh.algorithm, 'config-file');
+  }, 150);
 });
 
 loadBalancer.listen(PORT, () => {
