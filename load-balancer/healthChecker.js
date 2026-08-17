@@ -3,6 +3,7 @@ const config = require('./config');
 const { servers } = require('./backendServers');
 const logger = require('./logger');
 const metrics = require('./metricsService');
+const bus = require('./eventBus');
 
 const DEFAULT_INTERVAL_MS = config.healthCheck.intervalMs;
 const DEFAULT_TIMEOUT_MS = config.healthCheck.timeoutMs;
@@ -44,6 +45,7 @@ function checkBackendHealth(server, timeoutMs = DEFAULT_TIMEOUT_MS) {
           const to = server.isAlive ? 'UP' : 'DOWN';
           logger.logTransition({ backend: server.id, from, to, reason: `HTTP ${statusCode}` });
           metrics.recordHealthEvent({ serverId: server.id, oldStatus: from, newStatus: to });
+          bus.emit('healthTransition', { backend: server.id, from, to });
         }
 
         resolve(server.isAlive);
@@ -61,6 +63,7 @@ function checkBackendHealth(server, timeoutMs = DEFAULT_TIMEOUT_MS) {
       if (previousState !== false) {
         logger.logTransition({ backend: server.id, from: 'UP', to: 'DOWN', reason: error.message });
         metrics.recordHealthEvent({ serverId: server.id, oldStatus: 'UP', newStatus: 'DOWN' });
+        bus.emit('healthTransition', { backend: server.id, from: 'UP', to: 'DOWN' });
       }
 
       resolve(false);

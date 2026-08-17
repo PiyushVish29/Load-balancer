@@ -163,6 +163,17 @@ async function getUptimePercentagePerServer() {
   return results;
 }
 
+// Seeds the dashboard's charts with history on page load - live traffic
+// after that arrives over the socket instead of further REST polling.
+async function getRecentRequests(limit = 200) {
+  requireDb();
+  const rows = await prisma.requestRecord.findMany({
+    orderBy: { timestamp: 'desc' },
+    take: limit
+  });
+  return rows.reverse();
+}
+
 async function disconnect() {
   if (prisma) {
     await prisma.$disconnect();
@@ -177,5 +188,6 @@ module.exports = {
   getAverageResponseTimePerServer,
   getRequestsPerAlgorithm,
   getUptimePercentagePerServer,
+  getRecentRequests,
   disconnect
 };

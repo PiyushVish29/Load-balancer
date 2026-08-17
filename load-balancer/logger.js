@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const bus = require('./eventBus');
 
 const LOG_FILE = config.log.filePath;
 const MAX_MEMORY_LOGS = 1000;
@@ -45,7 +46,9 @@ function write(level, message) {
   }
 
   fileStream.write(line + '\n');
-  pushToMemory({ timestamp, level, message });
+  const entry = { timestamp, level, message };
+  pushToMemory(entry);
+  bus.emit('log', entry);
 }
 
 function info(message) { write(LEVELS.INFO, message); }

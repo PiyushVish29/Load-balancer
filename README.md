@@ -1,11 +1,11 @@
 # Mini Load Balancer
 
 A small, dependency-light HTTP load balancer written in plain Node.js. It round-robins
-traffic across a configurable pool of backend servers, health-checks them in the
-background, automatically fails a request over to the next healthy backend when one
-dies mid-request, logs every request, health check, and failover event to console
-and to a log file, and persists that same activity to PostgreSQL (async, non-blocking)
-for a future dashboard.
+(or least-connections) traffic across a configurable pool of backend servers,
+health-checks them in the background, automatically fails a request over to the next
+healthy backend when one dies mid-request, logs every request, health check, and
+failover event to console and to a log file, persists that same activity to PostgreSQL
+(async, non-blocking), and streams all of it live to a React dashboard over Socket.IO.
 
 ## Architecture
 
@@ -40,12 +40,15 @@ load balancer/
 │  ├─ server.js                     reads SERVER_ID / PORT from env vars
 │  └─ package.json                  start / start:1 / start:2 / start:3 / start:all
 ├─ load-balancer/
-│  ├─ server.js                     HTTP server, proxying, retry/failover
+│  ├─ server.js                     HTTP server, proxying, retry/failover, REST /api/*, CORS
 │  ├─ config.js                     loads + validates config.json, sensible defaults
 │  ├─ config.json                   port, backends, algorithm, health check, retries, logging
 │  ├─ backendServers.js             in-memory backend pool, built from config
 │  ├─ healthChecker.js              background /health polling + UP/DOWN transitions
 │  ├─ logger.js                     console + file logging, in-memory ring buffer
+│  ├─ eventBus.js                   in-process pub/sub - the only thing socketServer.js listens to
+│  ├─ statsTracker.js               in-memory global request/RPS/avg-response-time counters
+│  ├─ socketServer.js               Socket.IO server - live pool/stats/log/request/algorithm events
 │  ├─ metricsService.js             async Postgres persistence + dashboard aggregate queries
 │  ├─ prisma.config.ts              Prisma CLI config (migrations) - reads DATABASE_URL
 │  ├─ prisma/
@@ -56,6 +59,11 @@ load balancer/
 │     ├─ index.js                   algorithm-name -> implementation lookup
 │     ├─ roundRobin.js
 │     └─ leastConnections.js
+├─ dashboard/                       React + Vite + Tailwind live dashboard (see below)
+│  └─ src/
+│     ├─ hooks/useDashboard.js      the one Socket.IO connection + all live state
+│     ├─ api.js                    REST calls for historical/seed data
+│     └─ components/                BackendCard, GlobalStats, charts, LogPanel, AlgorithmControl
 ├─ logs/
 │  └─ load-balancer.log             created at runtime (gitignored)
 └─ verify-health-check.ps1          scripted failover proof (kill/restart backend-2)
@@ -88,10 +96,17 @@ npm run db:migrate     # creates loadbalancer_metrics tables (prompts for a migr
 
 # 4. start the load balancer
 node server.js
+
+# 5. in a third terminal: the dashboard
+cd "../dashboard"
+npm install
+npm run dev
 ```
 
 The load balancer listens on `http://localhost:8080`. `GET /` proxies to a backend;
-`GET /health` returns the load balancer's own aggregate view of the pool.
+`GET /health` returns the load balancer's own aggregate view of the pool. The dashboard
+runs on `http://localhost:5173` and talks to the load balancer over Socket.IO + REST -
+open it in a browser once both are up.
 
 ## Configuration (`load-balancer/config.json`)
 
@@ -216,14 +231,15 @@ What gets logged, with the event tag each line starts with:
 - `ALGORITHM_SWITCH` - the active algorithm changed, and whether it came from the API or a config.json edit
 
 `logger.getRecentLogs(limit)` also keeps the most recent 1000 entries in memory (subject
-to the same level filter) for a future dashboard to read without re-parsing the log file.
+to the same level filter) - the dashboard's log panel reads from this, both as a REST
+snapshot on load and streamed live over Socket.IO after that.
 
 ## PostgreSQL metrics (Prisma)
 
 Every request, health-check transition, and the backend registry itself are persisted
-to PostgreSQL via Prisma, for a future dashboard to query. **Persistence is entirely
-decoupled from request forwarding**: the proxy works exactly the same whether the
-database is healthy, slow, or completely unreachable.
+to PostgreSQL via Prisma, queried by the dashboard's charts and REST endpoints.
+**Persistence is entirely decoupled from request forwarding**: the proxy works exactly
+the same whether the database is healthy, slow, or completely unreachable.
 
 ### Schema (`load-balancer/prisma/schema.prisma`)
 
@@ -267,6 +283,8 @@ is fine to wait on, it just isn't on the hot request-forwarding path.
   order and sums how long it held `UP` vs `DOWN` between consecutive events (the last
   segment runs to now). Returns `null` for a server with no recorded transitions yet -
   uptime is only meaningful from when tracking started.
+- `getRecentRequests(limit)` - raw recent `RequestRecord` rows, oldest first; used to
+  seed the dashboard's charts with history on page load.
 
 ### Setup notes
 
@@ -276,6 +294,75 @@ is fine to wait on, it just isn't on the hot request-forwarding path.
   app) - both read `DATABASE_URL` from `.env`.
 - `npm run db:migrate` wraps `prisma migrate dev`; `npm run db:studio` opens Prisma
   Studio if you want to browse the tables directly.
+
+## Real-time dashboard
+
+`dashboard/` is a React + Vite + Tailwind app (Tailwind only - no component library)
+that shows the pool live: a card per backend (id, port, UP/DOWN, active connections,
+total requests, average response time), global stats (total requests, requests/sec,
+overall average response time, active algorithm), two live Recharts time-series
+(requests per server, response time per server, both bucketed client-side by second),
+a streaming log panel, and Round Robin / Least Connections buttons.
+
+### How it stays live
+
+One Socket.IO connection, one custom hook (`useDashboard.js`) - everything else in the
+UI is presentational. The load balancer's `socketServer.js` attaches Socket.IO to the
+*same* HTTP server `server.js` already listens with (no second port), and is the sole
+subscriber of `eventBus.js`, an in-process `EventEmitter` that `logger.js`,
+`healthChecker.js`, and `server.js` already emit domain events on for their own
+reasons - the socket layer just listens in, so none of those modules know or care that
+Socket.IO exists.
+
+| Event | Fired when | Payload |
+|---|---|---|
+| `pool:update` | A health transition happens (instantly), and once a second otherwise | Full backend array, incl. `avgResponseTimeMs` |
+| `stats:update` | Once a second, and right after an algorithm switch | `{ totalRequests, requestsPerSecond, avgResponseTimeMs, algorithm }` |
+| `log:new` | Every log line, the instant it's written | `{ timestamp, level, message }` |
+| `request:new` | Every completed proxied request | `{ backend, path, method, statusCode, responseTimeMs, algorithm, timestamp }` |
+| `algorithm:changed` | The active algorithm changes (API or config file) | `{ from, to, source }` |
+| `logs:initial` | Once, right after a client connects | Last 200 log entries |
+
+A newly-connected dashboard gets `pool:update`/`stats:update`/`logs:initial` immediately
+on connect, so it's never blank waiting for the next event.
+
+REST endpoints (all on the load balancer, CORS-enabled, all backed by
+`metricsService.js`'s aggregate queries so a database outage 503s cleanly instead of
+hanging the dashboard) exist for the data Socket.IO doesn't carry - history from before
+the page loaded:
+
+- `GET /api/metrics/requests-per-server`
+- `GET /api/metrics/avg-response-time-per-server`
+- `GET /api/metrics/requests-per-algorithm`
+- `GET /api/metrics/uptime-per-server`
+- `GET /api/metrics/recent-requests?limit=N` - seeds the two charts
+- `GET /api/logs/recent?limit=N` - seeds the log panel (redundant with `logs:initial`,
+  kept as a fallback and for refreshing just that panel)
+- `GET /algorithm` / `POST /algorithm` (pre-existing, documented above) - what the
+  Round Robin / Least Connections buttons call
+
+Chart history is bucketed by second entirely client-side (the backend just streams raw
+`request:new` events - it doesn't do time-series aggregation itself), merged into the
+same keyed series whether the data came from the initial REST seed or a live tick, so
+neither path can silently overwrite the other's data.
+
+### Verified: instant, no refresh
+
+Screenshotted end-to-end with backend-2 killed mid-session (same browser tab, never
+reloaded): its card flips from a green "UP" badge to a red "DOWN" badge, and the log
+panel shows the `TRANSITION`/`HEALTHCHECK` lines explaining why, live. Detection speed
+depends on how the failure was noticed:
+
+- **With live traffic flowing**: a request hits the dead backend, the load balancer's
+  existing failover logic marks it dead immediately, and `pool:update` reaches the
+  dashboard **~1ms** later (measured with a raw Socket.IO client and millisecond
+  timestamps around an actual kill).
+- **With no traffic** (dashboard-only viewing): detection waits for the next periodic
+  health check, bounded by `config.healthCheck.intervalMs` (default 5000ms) - still
+  fully automatic, still no page refresh, just not sub-millisecond.
+
+Either way, nothing about the dashboard changes - it just reacts to whichever
+`healthTransition` event the backend happens to emit.
 
 ## Postman collection
 

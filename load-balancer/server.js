@@ -2,11 +2,14 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const config = require('./config');
-const { servers } = require('./backendServers');
+const { servers, recordResponseTime, getAvgResponseTimeMs } = require('./backendServers');
 const { algorithms } = require('./algorithms');
 const { startHealthChecks } = require('./healthChecker');
 const logger = require('./logger');
 const metrics = require('./metricsService');
+const bus = require('./eventBus');
+const statsTracker = require('./statsTracker');
+const { initSocketServer } = require('./socketServer');
 
 const PORT = config.port;
 const BACKEND_TIMEOUT_MS = 3000;
@@ -33,7 +36,14 @@ function setAlgorithm(name, source) {
   const previous = currentAlgorithm;
   currentAlgorithm = name;
   logger.logAlgorithmSwitch({ from: previous, to: currentAlgorithm, source });
+  bus.emit('algorithmSwitch', { from: previous, to: currentAlgorithm, source });
   return { ok: true, changed: true, algorithm: currentAlgorithm };
+}
+
+function setCorsHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
 function sendErrorResponse(res, statusCode, message) {
@@ -41,11 +51,13 @@ function sendErrorResponse(res, statusCode, message) {
     res.destroy();
     return;
   }
+  setCorsHeaders(res);
   res.writeHead(statusCode, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: message }));
 }
 
 function sendJson(res, statusCode, body) {
+  setCorsHeaders(res);
   res.writeHead(statusCode, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
 }
@@ -132,6 +144,7 @@ function forwardToServer(targetServer, req, body, res, triedServerIds, ctx) {
     targetServer.isAlive = false;
     if (wasAlive) {
       logger.logTransition({ backend: targetServer.id, from: 'UP', to: 'DOWN', reason: error.message });
+      bus.emit('healthTransition', { backend: targetServer.id, from: 'UP', to: 'DOWN' });
     }
     logger.logRetry({ backend: targetServer.id, attempt: triedServerIds.length + 2, reason: error.message });
 
@@ -200,7 +213,54 @@ function handleAlgorithmEndpoint(req, res) {
   return sendErrorResponse(res, 405, 'Method not allowed');
 }
 
+// REST endpoints for the dashboard's historical views - all Postgres-backed
+// via metricsService, all read-only, all resilient to the database being
+// unavailable (503 instead of a hang or a crash). Live updates go over
+// Socket.IO instead; these exist for a fresh page load and for charts that
+// want more history than the in-memory event stream has seen.
+function handleApiRequest(req, res) {
+  const [pathname, queryString] = req.url.split('?');
+  const params = new URLSearchParams(queryString || '');
+  const limit = Number(params.get('limit')) || undefined;
+
+  const routes = {
+    '/api/metrics/requests-per-server': () => metrics.getRequestsPerServer(),
+    '/api/metrics/avg-response-time-per-server': () => metrics.getAverageResponseTimePerServer(),
+    '/api/metrics/requests-per-algorithm': () => metrics.getRequestsPerAlgorithm(),
+    '/api/metrics/uptime-per-server': () => metrics.getUptimePercentagePerServer(),
+    '/api/metrics/recent-requests': () => metrics.getRecentRequests(limit),
+    '/api/logs/recent': () => Promise.resolve(logger.getRecentLogs(limit))
+  };
+
+  const handler = routes[pathname];
+  if (!handler) {
+    return sendErrorResponse(res, 404, 'Not found');
+  }
+
+  handler()
+    .then((data) => sendJson(res, 200, data))
+    .catch((error) => {
+      logger.warn(`API_QUERY_FAILED path=${pathname} message="${error.message}"`);
+      sendErrorResponse(res, 503, 'Metrics database unavailable');
+    });
+}
+
 const loadBalancer = http.createServer((req, res) => {
+  // Socket.IO is attached to this same http.Server below and handles its
+  // own '/socket.io/*' requests via a separate 'request' listener - both
+  // listeners fire for every request, so we must not also try to route
+  // (and definitely not proxy) these ourselves.
+  if (req.url.startsWith('/socket.io/')) {
+    return;
+  }
+
+  if (req.method === 'OPTIONS') {
+    setCorsHeaders(res);
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   const ctx = {
     method: req.method,
     path: req.url,
@@ -234,6 +294,25 @@ const loadBalancer = http.createServer((req, res) => {
       responseTimeMs: roundedDurationMs,
       algorithm: getCurrentAlgorithm()
     });
+
+    // Only requests that actually reached the proxy path (not /health,
+    // /algorithm, /api/*, which never touch a backend) should count toward
+    // per-server/global request-serving stats and the live charts.
+    if (ctx.lastBackend) {
+      recordResponseTime(ctx.lastBackend, roundedDurationMs);
+    }
+    if (ctx.lastBackend || res.statusCode === 503) {
+      statsTracker.recordCompletedRequest(roundedDurationMs);
+      bus.emit('request', {
+        backend: ctx.lastBackend,
+        path: ctx.path,
+        method: ctx.method,
+        statusCode: res.statusCode,
+        responseTimeMs: roundedDurationMs,
+        algorithm: getCurrentAlgorithm(),
+        timestamp: new Date().toISOString()
+      });
+    }
   });
 
   // Covers the client disconnecting before the backend response completes
@@ -261,7 +340,8 @@ const loadBalancer = http.createServer((req, res) => {
         port: server.port,
         isAlive: server.isAlive,
         activeConnections: server.activeConnections,
-        totalRequests: server.totalRequests
+        totalRequests: server.totalRequests,
+        avgResponseTimeMs: getAvgResponseTimeMs(server)
       }))
     });
   }
@@ -270,8 +350,14 @@ const loadBalancer = http.createServer((req, res) => {
     return handleAlgorithmEndpoint(req, res);
   }
 
+  if (req.url.split('?')[0].startsWith('/api/')) {
+    return handleApiRequest(req, res);
+  }
+
   proxyRequest(req, res, ctx);
 });
+
+initSocketServer(loadBalancer, { getAlgorithm: getCurrentAlgorithm });
 
 // Lets `algorithm` in config.json be changed live: on every save, re-read
 // and re-validate the file and, if the algorithm field changed to a

@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+body {
+  background-color: #0f172a;
+  color: #e2e8f0;
+}
+
+/* Slim, dark-friendly scrollbar for the log panel */
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background-color: #334155;
+  border-radius: 9999px;
+}
