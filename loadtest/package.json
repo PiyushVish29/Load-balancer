@@ -1,0 +1,12 @@
+{
+  "name": "loadtest",
+  "private": true,
+  "version": "1.0.0",
+  "main": "run.js",
+  "scripts": {
+    "start": "node run.js"
+  },
+  "dependencies": {
+    "autocannon": "^7.15.0"
+  }
+}

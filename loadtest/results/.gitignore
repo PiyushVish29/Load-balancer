@@ -1,0 +1,4 @@
+# Every run writes a fresh timestamped copy here - only latest.json (the
+# stable filename future tooling reads) is worth committing as a live
+# example; per-run history would just be noise that grows forever.
+results-*.json

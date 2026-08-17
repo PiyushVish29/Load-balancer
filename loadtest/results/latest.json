@@ -1,0 +1,151 @@
+{
+  "generatedAt": "2026-08-17T22:21:01.862Z",
+  "config": {
+    "connections": 20,
+    "duration": 10
+  },
+  "scenarios": [
+    {
+      "name": "baseline-single-backend",
+      "description": "Direct load on backend-1 alone, load balancer not involved (20 conn, 10s).",
+      "summary": {
+        "durationSec": 11.01,
+        "connections": 20,
+        "totalRequests": 128847,
+        "requestsPerSec": 11713.82,
+        "latencyMs": {
+          "average": 1.12,
+          "p97_5": 2,
+          "max": 15
+        },
+        "errors": 0,
+        "timeouts": 0,
+        "non2xx": 0,
+        "allSuccessful": true,
+        "statusCodes": {
+          "200": {
+            "count": 128847
+          }
+        }
+      },
+      "distribution": null
+    },
+    {
+      "name": "round-robin",
+      "description": "Same load through the load balancer on Round Robin (20 conn, 10s).",
+      "summary": {
+        "durationSec": 10.02,
+        "connections": 20,
+        "totalRequests": 12412,
+        "requestsPerSec": 1241.2,
+        "latencyMs": {
+          "average": 15.61,
+          "p97_5": 24,
+          "max": 81
+        },
+        "errors": 0,
+        "timeouts": 0,
+        "non2xx": 0,
+        "allSuccessful": true,
+        "statusCodes": {
+          "200": {
+            "count": 12412
+          }
+        }
+      },
+      "distribution": {
+        "backend-1": 4144,
+        "backend-2": 4144,
+        "backend-3": 4144
+      }
+    },
+    {
+      "name": "least-connections",
+      "description": "Same load through the load balancer on Least Connections (20 conn, 10s).",
+      "summary": {
+        "durationSec": 10.02,
+        "connections": 20,
+        "totalRequests": 14049,
+        "requestsPerSec": 1404.9,
+        "latencyMs": {
+          "average": 13.75,
+          "p97_5": 21,
+          "max": 55
+        },
+        "errors": 0,
+        "timeouts": 0,
+        "non2xx": 0,
+        "allSuccessful": true,
+        "statusCodes": {
+          "200": {
+            "count": 14049
+          }
+        }
+      },
+      "distribution": {
+        "backend-1": 4690,
+        "backend-2": 4690,
+        "backend-3": 4689
+      }
+    },
+    {
+      "name": "mixed-fast-slow",
+      "description": "Round Robin, alternating fast (/) and slow (/work, ~300ms) requests (20 conn, 10s).",
+      "summary": {
+        "durationSec": 10.07,
+        "connections": 20,
+        "totalRequests": 1222,
+        "requestsPerSec": 122.2,
+        "latencyMs": {
+          "average": 162.83,
+          "p97_5": 329,
+          "max": 335
+        },
+        "errors": 0,
+        "timeouts": 0,
+        "non2xx": 0,
+        "allSuccessful": true,
+        "statusCodes": {
+          "200": {
+            "count": 1222
+          }
+        }
+      },
+      "distribution": {
+        "backend-1": 414,
+        "backend-2": 414,
+        "backend-3": 414
+      }
+    },
+    {
+      "name": "failover-under-load",
+      "description": "Round Robin, backend-2 killed at t+3333ms of a 10s run (20 conn). Client must see zero failures.",
+      "summary": {
+        "durationSec": 10.02,
+        "connections": 20,
+        "totalRequests": 14326,
+        "requestsPerSec": 1432.6,
+        "latencyMs": {
+          "average": 13.47,
+          "p97_5": 20,
+          "max": 55
+        },
+        "errors": 0,
+        "timeouts": 0,
+        "non2xx": 0,
+        "allSuccessful": true,
+        "statusCodes": {
+          "200": {
+            "count": 14326
+          }
+        }
+      },
+      "distribution": {
+        "backend-1": 6345,
+        "backend-2": 1658,
+        "backend-3": 6345
+      },
+      "note": "PASS - zero errors/timeouts/non-2xx despite the mid-run kill."
+    }
+  ]
+}

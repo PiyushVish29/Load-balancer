@@ -77,6 +77,11 @@ load balancer/
 │     ├─ hooks/useDashboard.js      the one Socket.IO connection + all live state
 │     ├─ api.js                    REST calls for historical/seed data
 │     └─ components/                BackendCard, GlobalStats, charts, LogPanel, AlgorithmControl
+├─ loadtest/                        Autocannon scenarios (see below)
+│  ├─ run.js                        orchestrator - spawns its own stack, runs 5 scenarios
+│  ├─ lib/processManager.js         spawn/kill/health-check backends + load balancer
+│  ├─ lib/report.js                 distribution snapshotting, summaries, console output
+│  └─ results/latest.json           committed example output (per-run history gitignored)
 ├─ logs/
 │  └─ load-balancer.log             created at runtime (gitignored)
 └─ verify-health-check.ps1          scripted failover proof (kill/restart backend-2)
@@ -474,3 +479,82 @@ printing the pool's state at each step. Run it standalone:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File "verify-health-check.ps1"
 ```
+
+## Load testing (Autocannon)
+
+`loadtest/run.js` is fully self-contained - one command spins up its own fresh backends
+and load balancer (killing anything already on those ports first, so it always starts
+from a clean, PID-tracked state), runs all five scenarios back to back, tears the stack
+back down, and writes results:
+
+```bash
+cd loadtest
+npm install
+npm start                                   # 20 connections, 10s per scenario (defaults)
+node run.js --connections=50 --duration=20  # override either
+```
+
+### Scenarios (same command, same connections/duration for a fair comparison)
+
+1. **`baseline-single-backend`** - load fired directly at `backend-1`, load balancer
+   not involved at all. The ceiling everything else is measured against.
+2. **`round-robin`** - same load through the load balancer, algorithm forced to Round
+   Robin first via `POST /algorithm`.
+3. **`least-connections`** - same load, switched to Least Connections.
+4. **`mixed-fast-slow`** - Round Robin, but each connection alternates between `/`
+   (near-instant) and `/work` (~300ms artificial delay) via autocannon's `requests`
+   array - the same fast/slow shape that showed Least Connections favoring the idle
+   server earlier in this README, now under sustained concurrent load rather than one
+   hand-timed burst.
+5. **`failover-under-load`** - Round Robin; at exactly 1/3 of the run's duration,
+   `backend-2`'s process is killed (a real `taskkill /F`, not a graceful shutdown) while
+   autocannon keeps firing. The scenario passes only if the client-facing result has
+   **zero** `errors` + `timeouts` + `non2xx` - autocannon's own counters, not anything
+   self-reported. Verified live at both a 3s/5-connection smoke scale and the 10s/20-connection
+   default: 0 failures both times, with the distribution showing `backend-2` picking up
+   proportionally fewer requests once it died (e.g. 1658 vs. 6345 each for the other two
+   in a 10s run killed at the 3.3s mark) and the other two backends absorbing the rest
+   through the existing retry-on-failure logic - not a new mechanism, just this repo's
+   failover under real concurrent traffic instead of a handful of sequential requests.
+
+### What's reported, and how
+
+Each scenario reports **requests/sec** (`requests.average`), **latency** (`average`,
+`p97_5`, `max`, in ms), and **error count** (`errors` + `timeouts` + `non2xx` broken out
+separately) straight from autocannon's own result object - nothing recomputed. Backend
+**distribution** needs no extra instrumentation: the load balancer's `/health` already
+exposes each server's cumulative `totalRequests`, so a snapshot immediately before and
+after each scenario, diffed, gives the exact per-backend count for just that run (`null`
+for the baseline scenario, since there's only one backend involved by design).
+
+### Output
+
+Every run writes `loadtest/results/latest.json` (always overwritten - what the next
+phase's charting should read) and a timestamped `loadtest/results/results-<ISO
+timestamp>.json` (kept locally for your own before/after comparisons, gitignored so
+history doesn't pile up in the repo). A committed `latest.json` from a real 20
+connection/10s run is included as a concrete example. Structure:
+
+```json
+{
+  "generatedAt": "...",
+  "config": { "connections": 20, "duration": 10 },
+  "scenarios": [
+    {
+      "name": "round-robin",
+      "description": "...",
+      "summary": {
+        "requestsPerSec": 1241.2,
+        "latencyMs": { "average": 15.61, "p97_5": 24, "max": 81 },
+        "totalRequests": 12412,
+        "errors": 0, "timeouts": 0, "non2xx": 0,
+        "allSuccessful": true
+      },
+      "distribution": { "backend-1": 4144, "backend-2": 4144, "backend-3": 4144 }
+    }
+  ]
+}
+```
+
+The script exits non-zero if `failover-under-load` isn't `allSuccessful` - wire it into
+CI as a real regression gate on failover behavior, not just a benchmark.
