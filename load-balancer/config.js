@@ -1,7 +1,10 @@
 const fs = require('fs');
 const path = require('path');
 
-const CONFIG_PATH = path.join(__dirname, 'config.json');
+// Overridable so a container can point at a docker-specific config (backend
+// hosts as container names instead of 127.0.0.1) without touching the file
+// local dev uses - unset, this is unchanged from before.
+const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
 
 const SUPPORTED_ALGORITHMS = ['round-robin', 'least-connections'];
 const LOG_LEVELS = ['INFO', 'WARN', 'ERROR'];

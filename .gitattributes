@@ -1,0 +1,6 @@
+# Files consumed inside Linux containers must keep LF endings regardless of
+# the checking-out machine's core.autocrlf setting - a CRLF-mangled shebang
+# line breaks the shell script the moment Docker copies it into an image.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.dockerignore text eol=lf

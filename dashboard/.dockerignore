@@ -1,0 +1,11 @@
+node_modules
+dist
+browser-check.js
+browser-check-screenshot.png
+kill-backend-check.js
+kill-check-before.png
+kill-check-after.png
+algorithm-click-check.js
+algorithm-click-after.png
+src/App.css
+src/assets

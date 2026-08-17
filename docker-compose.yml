@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: loadbalancer_metrics
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d loadbalancer_metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - lb-network
+
+  backend-1:
+    build: ./backend-server
+    container_name: backend-1
+    environment:
+      SERVER_ID: backend-1
+      PORT: 3001
+    networks:
+      - lb-network
+
+  backend-2:
+    build: ./backend-server
+    container_name: backend-2
+    environment:
+      SERVER_ID: backend-2
+      PORT: 3002
+    networks:
+      - lb-network
+
+  backend-3:
+    build: ./backend-server
+    container_name: backend-3
+    environment:
+      SERVER_ID: backend-3
+      PORT: 3003
+    networks:
+      - lb-network
+
+  load-balancer:
+    build: ./load-balancer
+    container_name: load-balancer
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/loadbalancer_metrics?schema=public
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend-1:
+        condition: service_started
+      backend-2:
+        condition: service_started
+      backend-3:
+        condition: service_started
+    networks:
+      - lb-network
+
+  dashboard:
+    build:
+      context: ./dashboard
+      args:
+        VITE_LB_URL: http://localhost:8080
+    container_name: dashboard
+    ports:
+      - "5173:80"
+    depends_on:
+      - load-balancer
+    networks:
+      - lb-network
+
+volumes:
+  pgdata:
+
+networks:
+  lb-network:
+    driver: bridge

@@ -1,0 +1,18 @@
+{
+  "port": 8080,
+  "backends": [
+    { "id": "backend-1", "host": "backend-1", "port": 3001 },
+    { "id": "backend-2", "host": "backend-2", "port": 3002 },
+    { "id": "backend-3", "host": "backend-3", "port": 3003 }
+  ],
+  "algorithm": "round-robin",
+  "healthCheck": {
+    "intervalMs": 5000,
+    "timeoutMs": 1500
+  },
+  "retryCount": 3,
+  "log": {
+    "filePath": "/app/logs/load-balancer.log",
+    "level": "INFO"
+  }
+}

@@ -34,15 +34,20 @@ client -> load balancer (:8080) -> backend-1 (:3001)
 ```text
 load balancer/
 ├─ README.md
+├─ docker-compose.yml               wires all six containers on one network
+├─ .gitattributes                   forces LF endings for .sh/Dockerfile (Windows checkouts)
 ├─ postman/
 │  └─ load-balancer.postman_collection.json
 ├─ backend-server/                  the backend used by every instance
 │  ├─ server.js                     reads SERVER_ID / PORT from env vars
-│  └─ package.json                  start / start:1 / start:2 / start:3 / start:all
+│  ├─ package.json                  start / start:1 / start:2 / start:3 / start:all
+│  ├─ Dockerfile
+│  └─ .dockerignore
 ├─ load-balancer/
 │  ├─ server.js                     HTTP server, proxying, retry/failover, REST /api/*, CORS
 │  ├─ config.js                     loads + validates config.json, sensible defaults
-│  ├─ config.json                   port, backends, algorithm, health check, retries, logging
+│  ├─ config.json                   local dev config - backends at 127.0.0.1
+│  ├─ config.docker.json            same shape, backends at container names (backend-1, ...)
 │  ├─ backendServers.js             in-memory backend pool, built from config
 │  ├─ healthChecker.js              background /health polling + UP/DOWN transitions
 │  ├─ logger.js                     console + file logging, in-memory ring buffer
@@ -54,12 +59,20 @@ load balancer/
 │  ├─ prisma/
 │  │  ├─ schema.prisma              Server / RequestRecord / HealthEvent models
 │  │  └─ migrations/
+│  ├─ docker/
+│  │  ├─ docker-entrypoint.sh       wait for db -> migrate deploy -> start server
+│  │  └─ wait-for-db.js             connection-retry loop against DATABASE_URL
+│  ├─ Dockerfile
+│  ├─ .dockerignore                 excludes .env - real secrets never enter the image
 │  ├─ .env                          DATABASE_URL (gitignored - see .env.example)
 │  └─ algorithms/
 │     ├─ index.js                   algorithm-name -> implementation lookup
 │     ├─ roundRobin.js
 │     └─ leastConnections.js
 ├─ dashboard/                       React + Vite + Tailwind live dashboard (see below)
+│  ├─ Dockerfile                    multi-stage: vite build -> served by nginx:alpine
+│  ├─ nginx.conf
+│  ├─ .dockerignore
 │  └─ src/
 │     ├─ hooks/useDashboard.js      the one Socket.IO connection + all live state
 │     ├─ api.js                    REST calls for historical/seed data
@@ -74,7 +87,75 @@ earlier iteration (one folder per backend, before `backend-server/` became a sin
 server driven by `SERVER_ID`/`PORT` env vars). They're superseded, excluded from git
 via `.gitignore`, and can be deleted.
 
-## Running it
+## Running it with Docker
+
+The fastest path - everything on one network, one command, on a clean machine with
+nothing but Docker installed:
+
+```bash
+docker compose up --build
+```
+
+This builds and starts six containers: `postgres`, `backend-1`/`backend-2`/`backend-3`
+(all from the same image, distinguished only by `SERVER_ID`/`PORT` env vars),
+`load-balancer`, and `dashboard`. Once it settles:
+
+- Dashboard: `http://localhost:5173`
+- Load balancer: `http://localhost:8080`
+- Backends are **not** published to the host - only reachable from other containers on
+  the compose network, exactly like a real deployment where only the load balancer is
+  internet-facing.
+
+### How the pieces fit together
+
+- **One shared network** (`lb-network`, a plain bridge network defined in
+  `docker-compose.yml`) - Compose gives every service DNS resolution by its service
+  name on that network, so the load balancer reaches backends at `http://backend-1:3001`
+  etc., never `localhost`. That's what `load-balancer/config.docker.json` points at
+  (vs. `config.json`'s `127.0.0.1` for local dev) - selected via a `CONFIG_PATH` env var
+  the Dockerfile sets, so local dev's `config.json` is untouched either way.
+- **The database dependency is enforced twice.** `docker-compose.yml` gives `postgres`
+  a real healthcheck (`pg_isready`) and makes `load-balancer` `depends_on: postgres:
+  condition: service_healthy` - Compose won't even *start* that container until
+  Postgres is accepting connections. On top of that, the load balancer's own
+  `docker/docker-entrypoint.sh` runs `docker/wait-for-db.js` (a small connection-retry
+  loop using the `pg` package directly) before running `prisma migrate deploy` to create
+  the schema in the fresh database, and only then starts `node server.js`. Belt and
+  suspenders: the compose-level gate is what actually matters, the app-level wait covers
+  the container ever being run outside Compose's orchestration.
+- **Every service has its own healthcheck**, baked into its Dockerfile (`HEALTHCHECK`)
+  rather than duplicated in the compose file: the backends and load balancer check their
+  own `/health` endpoint, the dashboard checks nginx is serving. `docker compose ps`
+  shows real health, not just "container running."
+- **Postgres data survives `docker compose down`** via the named volume `pgdata` -
+  only `docker compose down -v` (or deleting the volume explicitly) wipes it.
+- **The dashboard is a static build**, not a dev server: a multi-stage Dockerfile runs
+  `npm run build` and serves the output through `nginx:alpine`. `VITE_LB_URL` is a build
+  `ARG` (Vite inlines env vars at build time) - it stays `http://localhost:8080` by
+  default because the *browser*, not another container, is what connects to the load
+  balancer; a container-name URL would never resolve there.
+- **Migrations run automatically** the first time (`prisma migrate deploy` applies
+  everything under `load-balancer/prisma/migrations/`) - no manual `npm run db:migrate`
+  step, unlike the local-dev path below.
+
+Useful commands:
+
+```bash
+docker compose logs -f load-balancer   # tail one service's logs
+docker compose down                    # stop everything, keep the postgres volume
+docker compose down -v                 # stop everything and wipe postgres data too
+docker compose up --build backend-1    # rebuild/restart just one service
+```
+
+> **Note on this repo's own verification:** this Dockerization was written and
+> cross-checked (YAML parsed, every `COPY`/build-context path confirmed to exist,
+> `npm ci`/`prisma generate`/`prisma migrate deploy` all independently verified to work
+> against the actual package-lock files and migrations) in an environment with no Docker
+> daemon available and no admin rights to install one. It was not possible to actually
+> run `docker compose up` end-to-end here - please run it yourself and report back if
+> anything doesn't come up cleanly.
+
+## Running it locally (no Docker)
 
 Requires Node.js, npm, and a running PostgreSQL instance (only needed for metrics -
 see below; the proxy itself works without it).
