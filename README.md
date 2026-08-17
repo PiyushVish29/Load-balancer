@@ -3,8 +3,9 @@
 A small, dependency-light HTTP load balancer written in plain Node.js. It round-robins
 traffic across a configurable pool of backend servers, health-checks them in the
 background, automatically fails a request over to the next healthy backend when one
-dies mid-request, and logs every request, health check, and failover event to console
-and to a log file.
+dies mid-request, logs every request, health check, and failover event to console
+and to a log file, and persists that same activity to PostgreSQL (async, non-blocking)
+for a future dashboard.
 
 ## Architecture
 
@@ -45,6 +46,12 @@ load balancer/
 │  ├─ backendServers.js             in-memory backend pool, built from config
 │  ├─ healthChecker.js              background /health polling + UP/DOWN transitions
 │  ├─ logger.js                     console + file logging, in-memory ring buffer
+│  ├─ metricsService.js             async Postgres persistence + dashboard aggregate queries
+│  ├─ prisma.config.ts              Prisma CLI config (migrations) - reads DATABASE_URL
+│  ├─ prisma/
+│  │  ├─ schema.prisma              Server / RequestRecord / HealthEvent models
+│  │  └─ migrations/
+│  ├─ .env                          DATABASE_URL (gitignored - see .env.example)
 │  └─ algorithms/
 │     ├─ index.js                   algorithm-name -> implementation lookup
 │     ├─ roundRobin.js
@@ -61,18 +68,25 @@ via `.gitignore`, and can be deleted.
 
 ## Running it
 
-Requires Node.js and npm.
+Requires Node.js, npm, and a running PostgreSQL instance (only needed for metrics -
+see below; the proxy itself works without it).
 
 ```bash
-# 1. install the one real dependency (Express, for the backend servers)
+# 1. install the one real backend dependency (Express)
 cd "backend-server"
 npm install
 
 # 2. start all three backends (backend-1:3001, backend-2:3002, backend-3:3003)
 npm run start:all
 
-# 3. in another terminal, start the load balancer (no install needed - core Node only)
+# 3. in another terminal: install the load balancer's dependencies (this also
+#    runs `prisma generate` via postinstall) and point it at your database
 cd "../load-balancer"
+npm install
+cp .env.example .env   # edit DATABASE_URL if your Postgres setup differs
+npm run db:migrate     # creates loadbalancer_metrics tables (prompts for a migration name only if the schema changed)
+
+# 4. start the load balancer
 node server.js
 ```
 
@@ -203,6 +217,65 @@ What gets logged, with the event tag each line starts with:
 
 `logger.getRecentLogs(limit)` also keeps the most recent 1000 entries in memory (subject
 to the same level filter) for a future dashboard to read without re-parsing the log file.
+
+## PostgreSQL metrics (Prisma)
+
+Every request, health-check transition, and the backend registry itself are persisted
+to PostgreSQL via Prisma, for a future dashboard to query. **Persistence is entirely
+decoupled from request forwarding**: the proxy works exactly the same whether the
+database is healthy, slow, or completely unreachable.
+
+### Schema (`load-balancer/prisma/schema.prisma`)
+
+- **`Server`** - the backend registry (`id`, `host`, `port`). Kept in sync with
+  `config.json`'s `backends` list on every startup (upserted, so removed backends are
+  left in place rather than deleted - their historical rows stay valid).
+- **`RequestRecord`** - one row per client request: `timestamp`, `serverId` (nullable -
+  null for a request that got a 503 with no backend involved), `path`, `method`,
+  `statusCode`, `responseTimeMs`, `algorithm`.
+- **`HealthEvent`** - one row per UP<->DOWN transition (not every poll - only actual
+  state changes, same as the logger's `TRANSITION` lines): `serverId`, `oldStatus`,
+  `newStatus`, `timestamp`.
+
+### Why writes can't slow down or break the proxy
+
+`metricsService.js`'s write functions (`recordRequest`, `recordHealthEvent`,
+`syncServerRegistry`) are **fire-and-forget**: the load balancer calls them and moves
+on immediately without `await`ing the result. Each call attaches its own `.catch()`, so
+a failed write - slow database, connection refused, whatever - is logged as
+`METRICS_WRITE_FAILED` (or `METRICS_REGISTRY_SYNC_FAILED` at startup) and dropped; it
+never throws back into the request path. If the Prisma client can't even be constructed
+(missing/invalid `DATABASE_URL`), metrics are disabled entirely at startup
+(`METRICS_DISABLED`) and every write function becomes a no-op - the rest of the load
+balancer is unaffected either way.
+
+Verified live: with `DATABASE_URL` pointed at an unreachable port (simulating the
+database being down), the load balancer still started immediately, `/health` and `/`
+kept returning correct responses in single-digit milliseconds, and every dropped write
+showed up as a `METRICS_WRITE_FAILED` log line. Once the database became reachable
+again, writes resumed on their own - no restart needed.
+
+### Aggregate queries (for the dashboard)
+
+Unlike the writes above, these ARE awaited by whatever calls them - a dashboard request
+is fine to wait on, it just isn't on the hot request-forwarding path.
+
+- `getRequestsPerServer()` - request count grouped by backend
+- `getAverageResponseTimePerServer()` - average `responseTimeMs` grouped by backend
+- `getRequestsPerAlgorithm()` - request count grouped by algorithm
+- `getUptimePercentagePerServer()` - for each server, walks its `HealthEvent` rows in
+  order and sums how long it held `UP` vs `DOWN` between consecutive events (the last
+  segment runs to now). Returns `null` for a server with no recorded transitions yet -
+  uptime is only meaningful from when tracking started.
+
+### Setup notes
+
+- Uses Prisma 7's driver-adapter model (`@prisma/adapter-pg`), which moved the
+  connection string out of `schema.prisma` and into `prisma.config.ts` (for the CLI) and
+  an explicit `PrismaPg` adapter passed to `new PrismaClient({ adapter })` (for the
+  app) - both read `DATABASE_URL` from `.env`.
+- `npm run db:migrate` wraps `prisma migrate dev`; `npm run db:studio` opens Prisma
+  Studio if you want to browse the tables directly.
 
 ## Postman collection
 

@@ -1,5 +1,6 @@
 node_modules/
 npm-debug.log*
+.env
 
 # Runtime log output - the directory is tracked, the log files are not
 logs/*.log

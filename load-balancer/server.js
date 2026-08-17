@@ -6,6 +6,7 @@ const { servers } = require('./backendServers');
 const { algorithms } = require('./algorithms');
 const { startHealthChecks } = require('./healthChecker');
 const logger = require('./logger');
+const metrics = require('./metricsService');
 
 const PORT = config.port;
 const BACKEND_TIMEOUT_MS = 3000;
@@ -215,12 +216,23 @@ const loadBalancer = http.createServer((req, res) => {
   res.on('finish', () => {
     responded = true;
     const durationMs = Number(process.hrtime.bigint() - ctx.startTime) / 1e6;
+    const roundedDurationMs = Math.round(durationMs * 100) / 100;
     logger.logResponse({
       backend: ctx.lastBackend,
       method: ctx.method,
       path: ctx.path,
       status: res.statusCode,
-      durationMs: Math.round(durationMs * 100) / 100
+      durationMs: roundedDurationMs
+    });
+    // Fire-and-forget - never awaited, so a slow/down database can't add
+    // latency here or turn a successful response into a failed one.
+    metrics.recordRequest({
+      backendId: ctx.lastBackend,
+      path: ctx.path,
+      method: ctx.method,
+      statusCode: res.statusCode,
+      responseTimeMs: roundedDurationMs,
+      algorithm: getCurrentAlgorithm()
     });
   });
 
@@ -290,5 +302,9 @@ fs.watch(path.dirname(config.CONFIG_PATH), { persistent: false }, (eventType, fi
 loadBalancer.listen(PORT, () => {
   logger.info(`Load balancer listening on http://localhost:${PORT}`);
   logger.info(`CONFIG algorithm=${config.algorithm} backends=${servers.map((s) => s.id).join(',')} retryCount=${config.retryCount} maxAttempts=${MAX_ATTEMPTS} healthCheckIntervalMs=${config.healthCheck.intervalMs} healthCheckTimeoutMs=${config.healthCheck.timeoutMs} logLevel=${config.log.level} logFile=${config.log.filePath}`);
+  // Fire-and-forget - the port is already bound and accepting connections
+  // by the time this callback runs, so a slow/unreachable database here
+  // delays neither that nor the health checks starting below.
+  metrics.syncServerRegistry(servers);
   startHealthChecks();
 });

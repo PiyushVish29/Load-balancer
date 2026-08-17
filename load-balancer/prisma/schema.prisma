@@ -1,0 +1,55 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// The backend pool, kept in sync with config.json's `backends` list on
+// startup (see metricsService.syncServerRegistry). RequestRecord and
+// HealthEvent rows reference it by id (e.g. "backend-1").
+model Server {
+  id        String   @id
+  host      String
+  port      Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  requests     RequestRecord[]
+  healthEvents HealthEvent[]
+}
+
+// One row per client request handled by the load balancer. serverId is
+// nullable because a request that exhausts every retry (503, no backend
+// available) never reaches a server at all.
+model RequestRecord {
+  id             Int      @id @default(autoincrement())
+  timestamp      DateTime @default(now())
+  server         Server?  @relation(fields: [serverId], references: [id])
+  serverId       String?
+  path           String
+  method         String
+  statusCode     Int
+  responseTimeMs Float
+  algorithm      String
+
+  @@index([serverId])
+  @@index([algorithm])
+  @@index([timestamp])
+}
+
+// One row per UP<->DOWN transition (not every health check - only actual
+// state changes), matching the load balancer's existing TRANSITION log
+// lines. Used to compute uptime percentage per server.
+model HealthEvent {
+  id        Int      @id @default(autoincrement())
+  server    Server   @relation(fields: [serverId], references: [id])
+  serverId  String
+  oldStatus String
+  newStatus String
+  timestamp DateTime @default(now())
+
+  @@index([serverId])
+  @@index([timestamp])
+}
