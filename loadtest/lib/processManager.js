@@ -101,11 +101,29 @@ function freePort(port) {
   });
 }
 
+// Polls the load balancer's /health until a specific backend's isAlive flag
+// matches what's expected, returning how long that took (ms) - or null on
+// timeout. Used to measure real failure-detection and recovery time rather
+// than assuming config.healthCheck.intervalMs.
+async function waitForBackendStatus(healthUrl, backendId, expectedAlive, { timeoutMs = 8000, intervalMs = 50 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const body = await getJson(healthUrl).catch(() => null);
+    const backend = body && (body.backends || []).find((b) => b.id === backendId);
+    if (backend && backend.isAlive === expectedAlive) {
+      return Date.now() - start;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return null;
+}
+
 module.exports = {
   getJson,
   waitForHealthy,
   spawnBackend,
   spawnLoadBalancer,
   killProcess,
-  freePort
+  freePort,
+  waitForBackendStatus
 };

@@ -218,6 +218,11 @@ function handleAlgorithmEndpoint(req, res) {
 // unavailable (503 instead of a hang or a crash). Live updates go over
 // Socket.IO instead; these exist for a fresh page load and for charts that
 // want more history than the in-memory event stream has seen.
+function readLoadtestResults() {
+  const filePath = path.join(__dirname, '..', 'loadtest', 'results', 'latest.json');
+  return fs.promises.readFile(filePath, 'utf8').then((content) => JSON.parse(content));
+}
+
 function handleApiRequest(req, res) {
   const [pathname, queryString] = req.url.split('?');
   const params = new URLSearchParams(queryString || '');
@@ -229,7 +234,9 @@ function handleApiRequest(req, res) {
     '/api/metrics/requests-per-algorithm': () => metrics.getRequestsPerAlgorithm(),
     '/api/metrics/uptime-per-server': () => metrics.getUptimePercentagePerServer(),
     '/api/metrics/recent-requests': () => metrics.getRecentRequests(limit),
-    '/api/logs/recent': () => Promise.resolve(logger.getRecentLogs(limit))
+    '/api/metrics/health-events': () => metrics.getRecentHealthEvents({ serverId: params.get('serverId') || undefined, limit }),
+    '/api/logs/recent': () => Promise.resolve(logger.getRecentLogs(limit)),
+    '/api/loadtest/latest': () => readLoadtestResults()
   };
 
   const handler = routes[pathname];
@@ -241,7 +248,10 @@ function handleApiRequest(req, res) {
     .then((data) => sendJson(res, 200, data))
     .catch((error) => {
       logger.warn(`API_QUERY_FAILED path=${pathname} message="${error.message}"`);
-      sendErrorResponse(res, 503, 'Metrics database unavailable');
+      const message = pathname === '/api/loadtest/latest'
+        ? 'No load test results found - run loadtest/run.js first'
+        : 'Metrics database unavailable';
+      sendErrorResponse(res, 503, message);
     });
 }
 

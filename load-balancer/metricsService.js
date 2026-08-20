@@ -174,6 +174,19 @@ async function getRecentRequests(limit = 200) {
   return rows.reverse();
 }
 
+// Raw transition history for a server (or all servers) - used to compute
+// things like failover recovery time (gap between an UP->DOWN row and the
+// DOWN->UP row that follows it) without re-deriving it from log files.
+async function getRecentHealthEvents({ serverId, limit = 50 } = {}) {
+  requireDb();
+  const rows = await prisma.healthEvent.findMany({
+    where: serverId ? { serverId } : undefined,
+    orderBy: { timestamp: 'desc' },
+    take: limit
+  });
+  return rows.reverse();
+}
+
 async function disconnect() {
   if (prisma) {
     await prisma.$disconnect();
@@ -189,5 +202,6 @@ module.exports = {
   getRequestsPerAlgorithm,
   getUptimePercentagePerServer,
   getRecentRequests,
+  getRecentHealthEvents,
   disconnect
 };

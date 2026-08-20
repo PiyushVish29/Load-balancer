@@ -8,7 +8,8 @@ const {
   spawnBackend,
   spawnLoadBalancer,
   killProcess,
-  freePort
+  freePort,
+  waitForBackendStatus
 } = require('./lib/processManager');
 const {
   snapshotBackendRequests,
@@ -148,9 +149,28 @@ async function main() {
     });
     after = snapshotBackendRequests(await getJson(`${LB_URL}/health`));
     scenarios.push({
-      name: 'mixed-fast-slow',
+      name: 'mixed-fast-slow-round-robin',
       description: `Round Robin, alternating fast (/) and slow (/work, ~300ms) requests (${connections} conn, ${duration}s).`,
       summary: summarize(mixedResult),
+      distribution: diffBackendRequests(before, after)
+    });
+
+    // --- scenario 4b: mixed fast/slow workload, least connections ----------
+    console.log('\nRunning scenario: mixed fast/slow workload (least connections)...');
+    await setAlgorithm('least-connections');
+    await sleep(300);
+    before = snapshotBackendRequests(await getJson(`${LB_URL}/health`));
+    const mixedLcResult = await runAutocannon({
+      url: LB_URL,
+      connections,
+      duration,
+      requests: [{ method: 'GET', path: '/' }, { method: 'GET', path: '/work' }]
+    });
+    after = snapshotBackendRequests(await getJson(`${LB_URL}/health`));
+    scenarios.push({
+      name: 'mixed-fast-slow-least-connections',
+      description: `Least Connections, same alternating fast/slow workload (${connections} conn, ${duration}s) - the direct comparison point for uneven load.`,
+      summary: summarize(mixedLcResult),
       distribution: diffBackendRequests(before, after)
     });
 
@@ -165,15 +185,18 @@ async function main() {
     await sleep(killAtMs);
     console.log(`  [t+${killAtMs}ms] killing backend-2...`);
     await killProcess(backendProcs['backend-2']);
-    console.log('  backend-2 killed - load test continues...');
+    const detectionMs = await waitForBackendStatus(`${LB_URL}/health`, 'backend-2', false);
+    console.log(`  backend-2 marked DOWN after ${detectionMs}ms - load test continues...`);
 
     const failoverResult = await failoverPromise;
     after = snapshotBackendRequests(await getJson(`${LB_URL}/health`));
 
-    // Restart backend-2 so the stack is left healthy.
+    // Restart backend-2 and measure how long the health checker takes to
+    // notice it's back - this is the "recovery time" half of the failover
+    // story, separate from "did the client drop any requests" (it didn't).
     backendProcs['backend-2'] = spawnBackend('backend-2', BACKEND_PORTS['backend-2']);
-    await waitForHealthy(`http://localhost:${BACKEND_PORTS['backend-2']}/health`);
-    console.log('  backend-2 restarted.');
+    const recoveryMs = await waitForBackendStatus(`${LB_URL}/health`, 'backend-2', true);
+    console.log(`  backend-2 restarted and marked UP again after ${recoveryMs}ms.`);
 
     const failoverSummary = summarize(failoverResult);
     scenarios.push({
@@ -181,8 +204,13 @@ async function main() {
       description: `Round Robin, backend-2 killed at t+${killAtMs}ms of a ${duration}s run (${connections} conn). Client must see zero failures.`,
       summary: failoverSummary,
       distribution: diffBackendRequests(before, after),
+      failover: {
+        detectionMs,
+        recoveryMs,
+        droppedRequests: failoverSummary.errors + failoverSummary.timeouts + failoverSummary.non2xx
+      },
       note: failoverSummary.allSuccessful
-        ? 'PASS - zero errors/timeouts/non-2xx despite the mid-run kill.'
+        ? `PASS - zero errors/timeouts/non-2xx despite the mid-run kill. Detected DOWN in ${detectionMs}ms, recovered (marked UP again) in ${recoveryMs}ms after restart.`
         : 'FAIL - client-visible failures occurred during failover.'
     });
   } finally {
